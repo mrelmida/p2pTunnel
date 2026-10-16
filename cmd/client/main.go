@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -57,19 +58,28 @@ func main() {
 }
 
 func runHeadless(serverAddr, serverSecret, peerName string, create bool, code, password, sharesRaw string, forceRelay bool) {
-	var lastLogCount int
+	var (
+		logMu      sync.Mutex
+		lastLogSeq uint64
+	)
 	mgr, err := client.NewManager(client.ManagerConfig{
 		ServerAddr:   serverAddr,
 		ServerSecret: serverSecret,
 		PeerName:     peerName,
 		ForceRelay:   forceRelay,
 		OnStateChange: func(snap client.Snapshot) {
-			if len(snap.Logs) > lastLogCount {
-				for _, line := range snap.Logs[lastLogCount:] {
-					fmt.Println(line)
-				}
-				lastLogCount = len(snap.Logs)
+			// Called from multiple goroutines; Logs is a capped window, so
+			// count new lines with LogSeq rather than len(Logs).
+			logMu.Lock()
+			defer logMu.Unlock()
+			if snap.LogSeq <= lastLogSeq {
+				return
 			}
+			newLines := int(min(snap.LogSeq-lastLogSeq, uint64(len(snap.Logs))))
+			for _, line := range snap.Logs[len(snap.Logs)-newLines:] {
+				fmt.Println(line)
+			}
+			lastLogSeq = snap.LogSeq
 		},
 	})
 	if err != nil {

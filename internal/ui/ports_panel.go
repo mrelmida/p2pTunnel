@@ -4,273 +4,92 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"p2pTunnel/internal/client"
 )
 
-type portsPanel struct {
+// ---------------------------------------------------------------------------
+// Shared with you: other peers' ports, mapped onto this machine.
+// ---------------------------------------------------------------------------
+
+type remotePortsPanel struct {
 	ui *UI
 
-	protoSelect *widget.Select
-	portEntry   *widget.Entry
-	labelEntry  *widget.Entry
-
-	mu             sync.RWMutex
-	localShares    []client.LocalShareStatus
-	remoteBindings []client.RemoteBindingStatus
-
-	localList   *widget.List
-	localEmpty  *widget.Label
-	remoteList  *widget.List
-	remoteEmpty *widget.Label
-
-	root fyne.CanvasObject
+	items []client.RemoteBindingStatus
+	list  *widget.List
+	panel fyne.CanvasObject
+	empty fyne.CanvasObject
+	root  fyne.CanvasObject
 }
 
-func newPortsPanel(u *UI) *portsPanel {
-	pp := &portsPanel{ui: u}
+func newRemotePortsPanel(u *UI) *remotePortsPanel {
+	rp := &remotePortsPanel{ui: u}
 
-	// --- Top section: Share a Local Port ---
-	pp.protoSelect = widget.NewSelect([]string{"TCP", "UDP", "TCP + UDP"}, nil)
-	pp.protoSelect.SetSelected("TCP")
+	rp.empty = newEmptyState(theme.DownloadIcon(), "Nothing shared with you yet",
+		"When someone in the room shares a port, it appears here with an address "+
+			"you can paste into your game, browser, or app.")
 
-	pp.portEntry = widget.NewEntry()
-	pp.portEntry.SetPlaceHolder("Port (e.g. 25565)")
-
-	pp.labelEntry = widget.NewEntry()
-	pp.labelEntry.SetPlaceHolder("Label (e.g. Minecraft, Web Dev)")
-
-	shareBtn := widget.NewButtonWithIcon("Share Port", theme.ContentAddIcon(), pp.onSharePort)
-	shareBtn.Importance = widget.HighImportance
-
-	presetMC := widget.NewButton("Minecraft (:25565)", func() {
-		pp.protoSelect.SetSelected("TCP + UDP")
-		pp.portEntry.SetText("25565")
-		pp.labelEntry.SetText("Minecraft")
-		pp.onSharePort()
-	})
-	presetWeb := widget.NewButton("HTTP (:8080)", func() {
-		pp.protoSelect.SetSelected("TCP")
-		pp.portEntry.SetText("8080")
-		pp.labelEntry.SetText("Web Server")
-		pp.onSharePort()
-	})
-	presetVite := widget.NewButton("Dev (:5173)", func() {
-		pp.protoSelect.SetSelected("TCP")
-		pp.portEntry.SetText("5173")
-		pp.labelEntry.SetText("Dev Server")
-		pp.onSharePort()
-	})
-
-	shareForm := container.NewVBox(
-		container.NewBorder(
-			nil, nil,
-			pp.protoSelect,
-			shareBtn,
-			container.NewGridWithColumns(2, pp.portEntry, pp.labelEntry),
-		),
-		container.NewHBox(
-			widget.NewLabel("Quick Share:"),
-			presetMC,
-			presetWeb,
-			presetVite,
-		),
-	)
-
-	pp.localEmpty = widget.NewLabelWithStyle(
-		"No local ports shared yet. Enter a port above so connected peers can reach your service.",
-		fyne.TextAlignCenter,
-		fyne.TextStyle{Italic: true},
-	)
-	pp.localEmpty.Wrapping = fyne.TextWrapWord
-
-	pp.localList = widget.NewList(
-		func() int {
-			pp.mu.RLock()
-			defer pp.mu.RUnlock()
-			return len(pp.localShares)
-		},
-		func() fyne.CanvasObject {
-			titleLbl := widget.NewLabelWithStyle("TCP :25565 — Minecraft", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-			statsLbl := widget.NewLabel("0 active conns • 0 B transferred")
-			stopBtn := widget.NewButtonWithIcon("Stop", theme.DeleteIcon(), nil)
-			stopBtn.Importance = widget.DangerImportance
-			return container.NewBorder(nil, nil, nil, stopBtn, container.NewVBox(titleLbl, statsLbl))
-		},
+	rp.list = widget.NewList(
+		func() int { return len(rp.items) },
+		func() fyne.CanvasObject { return newRemoteRow(rp) },
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			pp.mu.RLock()
-			if id < 0 || id >= len(pp.localShares) {
-				pp.mu.RUnlock()
+			if id < 0 || id >= len(rp.items) {
 				return
 			}
-			sh := pp.localShares[id]
-			pp.mu.RUnlock()
-
-			border := obj.(*fyne.Container)
-			left := border.Objects[0].(*fyne.Container)
-			stopBtn := border.Objects[1].(*widget.Button)
-
-			titleLbl := left.Objects[0].(*widget.Label)
-			statsLbl := left.Objects[1].(*widget.Label)
-
-			labelPart := sh.Name
-			if labelPart == "" {
-				labelPart = "Shared Service"
-			}
-			titleLbl.SetText(fmt.Sprintf("%s :%d — %s", strings.ToUpper(sh.Protocol), sh.Port, labelPart))
-			statsLbl.SetText(fmt.Sprintf("%d active connection(s) • %s transferred", sh.ActiveConns, formatBytes(sh.BytesTotal)))
-
-			proto := sh.Protocol
-			port := sh.Port
-			stopBtn.OnTapped = func() {
-				pp.ui.mgr.RemoveSharedPort(proto, port)
-			}
+			obj.(*remoteRow).set(rp.items[id])
 		},
 	)
+	rp.list.OnSelected = func(widget.ListItemID) { rp.list.UnselectAll() }
 
-	localCard := widget.NewCard(
-		"My Shared Ports (Exposed to Room)",
-		"Only ports listed here can be accessed by room members",
-		container.NewBorder(
-			container.NewVBox(shareForm, widget.NewSeparator()),
-			nil, nil, nil,
-			container.NewStack(pp.localList, pp.localEmpty),
-		),
-	)
-
-	// --- Bottom section: Remote Ports from Room Peers ---
-	pp.remoteEmpty = widget.NewLabelWithStyle(
-		"No remote ports shared by peers yet. When someone in the room shares a port, it will automatically bind here on their 127.0.0.x IP.",
-		fyne.TextAlignCenter,
-		fyne.TextStyle{Italic: true},
-	)
-	pp.remoteEmpty.Wrapping = fyne.TextWrapWord
-
-	pp.remoteList = widget.NewList(
-		func() int {
-			pp.mu.RLock()
-			defer pp.mu.RUnlock()
-			return len(pp.remoteBindings)
-		},
-		func() fyne.CanvasObject {
-			titleLbl := widget.NewLabelWithStyle("Bob — Minecraft (TCP :25565)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-			addrLbl := widget.NewLabelWithStyle("Connect at: 127.0.0.3:25565", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
-			copyBtn := widget.NewButtonWithIcon("Copy Address", theme.ContentCopyIcon(), nil)
-			copyBtn.Importance = widget.HighImportance
-			customBtn := widget.NewButtonWithIcon("Custom Port...", theme.SettingsIcon(), nil)
-			toggleBtn := widget.NewButton("Pause", nil)
-
-			btns := container.NewHBox(copyBtn, customBtn, toggleBtn)
-			return container.NewBorder(nil, nil, nil, btns, container.NewVBox(titleLbl, addrLbl))
-		},
-		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			pp.mu.RLock()
-			if id < 0 || id >= len(pp.remoteBindings) {
-				pp.mu.RUnlock()
-				return
-			}
-			rb := pp.remoteBindings[id]
-			pp.mu.RUnlock()
-
-			border := obj.(*fyne.Container)
-			left := border.Objects[0].(*fyne.Container)
-			btns := border.Objects[1].(*fyne.Container)
-
-			titleLbl := left.Objects[0].(*widget.Label)
-			addrLbl := left.Objects[1].(*widget.Label)
-
-			copyBtn := btns.Objects[0].(*widget.Button)
-			customBtn := btns.Objects[1].(*widget.Button)
-			toggleBtn := btns.Objects[2].(*widget.Button)
-
-			svcName := rb.Name
-			if svcName == "" {
-				svcName = "Port"
-			}
-			titleLbl.SetText(fmt.Sprintf("%s — %s (%s :%d)", rb.PeerName, svcName, strings.ToUpper(rb.Protocol), rb.RemotePort))
-
-			displayAddr := rb.ActualBound
-			if displayAddr == "" {
-				displayAddr = fmt.Sprintf("%s:%d", rb.BindIP, rb.LocalPort)
-			}
-
-			if !rb.Enabled {
-				addrLbl.SetText(fmt.Sprintf("PAUSED (would bind %s)", displayAddr))
-				toggleBtn.SetText("Enable")
-				copyBtn.Disable()
-			} else if rb.StatusErr != "" {
-				addrLbl.SetText(fmt.Sprintf("Bind Error: %s", rb.StatusErr))
-				toggleBtn.SetText("Pause")
-				copyBtn.Disable()
-			} else {
-				addrLbl.SetText(fmt.Sprintf("Ready at %s  •  %d active  •  %s",
-					displayAddr, rb.ActiveConns, formatBytes(rb.BytesTotal)))
-				toggleBtn.SetText("Pause")
-				copyBtn.Enable()
-			}
-
-			addrToCopy := displayAddr
-			copyBtn.OnTapped = func() {
-				pp.ui.win.Clipboard().SetContent(addrToCopy)
-				pp.ui.setFooterStatus(fmt.Sprintf("Copied %s to clipboard", addrToCopy))
-			}
-
-			bindingCopy := rb
-			customBtn.OnTapped = func() {
-				pp.showCustomBindDialog(bindingCopy)
-			}
-			toggleBtn.OnTapped = func() {
-				pp.ui.mgr.SetRemotePortEnabled(bindingCopy.Key, !bindingCopy.Enabled)
-			}
-		},
-	)
-
-	remoteCard := widget.NewCard(
-		"Available Remote Ports (Auto-Mapped from Peers)",
-		"Use Copy Address to paste the 127.0.0.x:PORT into your game, browser, or client",
-		container.NewStack(pp.remoteList, pp.remoteEmpty),
-	)
-
-	split := container.NewVSplit(localCard, remoteCard)
-	split.Offset = 0.46
-	pp.root = split
-	return pp
+	rp.panel = newSurface(container.New(layout.NewCustomPaddedLayout(4, 4, 4, 4), rp.list), colorNameSurface)
+	rp.root = container.New(layout.NewCustomPaddedLayout(10, 0, 0, 0), container.NewStack(rp.panel, rp.empty))
+	return rp
 }
 
-func (pp *portsPanel) onSharePort() {
-	portStr := strings.TrimSpace(pp.portEntry.Text)
-	val, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil || val == 0 {
-		dialog.ShowError(fmt.Errorf("please enter a valid port number between 1 and 65535"), pp.ui.win)
-		return
+func (rp *remotePortsPanel) refresh(snap client.Snapshot) {
+	rp.items = snap.RemoteBindings
+	if len(rp.items) == 0 {
+		rp.panel.Hide()
+		rp.empty.Show()
+	} else {
+		rp.empty.Hide()
+		rp.panel.Show()
 	}
-
-	protoChoice := pp.protoSelect.Selected
-	proto := "tcp"
-	switch protoChoice {
-	case "UDP":
-		proto = "udp"
-	case "TCP + UDP":
-		proto = "both"
-	}
-
-	name := strings.TrimSpace(pp.labelEntry.Text)
-	if err := pp.ui.mgr.AddSharedPort(proto, uint16(val), name); err != nil {
-		dialog.ShowError(err, pp.ui.win)
-		return
-	}
-	pp.portEntry.SetText("")
-	pp.labelEntry.SetText("")
+	rp.list.Refresh()
 }
 
-func (pp *portsPanel) showCustomBindDialog(rb client.RemoteBindingStatus) {
+func (rp *remotePortsPanel) showMenu(rb client.RemoteBindingStatus, anchor fyne.CanvasObject) {
+	toggle := fyne.NewMenuItem("Pause", func() {
+		go rp.ui.mgr.SetRemotePortEnabled(rb.Key, false)
+	})
+	toggle.Icon = theme.MediaPauseIcon()
+	if !rb.Enabled {
+		toggle = fyne.NewMenuItem("Resume", func() {
+			go rp.ui.mgr.SetRemotePortEnabled(rb.Key, true)
+		})
+		toggle.Icon = theme.MediaPlayIcon()
+	}
+	change := fyne.NewMenuItem("Change local address…", func() {
+		rp.showCustomBindDialog(rb)
+	})
+	change.Icon = theme.SettingsIcon()
+
+	widget.ShowPopUpMenuAtRelativePosition(
+		fyne.NewMenu("", toggle, change),
+		rp.ui.win.Canvas(),
+		fyne.NewPos(0, anchor.Size().Height),
+		anchor,
+	)
+}
+
+func (rp *remotePortsPanel) showCustomBindDialog(rb client.RemoteBindingStatus) {
 	ipEntry := widget.NewEntry()
 	ipEntry.SetText(rb.BindIP)
 	ipEntry.SetPlaceHolder(rb.PeerIP)
@@ -278,61 +97,309 @@ func (pp *portsPanel) showCustomBindDialog(rb client.RemoteBindingStatus) {
 	portEntry := widget.NewEntry()
 	portEntry.SetText(strconv.Itoa(int(rb.LocalPort)))
 	portEntry.SetPlaceHolder(strconv.Itoa(int(rb.RemotePort)))
+	portEntry.Validator = validatePort
 
-	resetBtn := widget.NewButton("Reset to Peer Default ("+rb.PeerIP+")", func() {
+	resetBtn := widget.NewButtonWithIcon("Reset to default", theme.ContentUndoIcon(), func() {
 		ipEntry.SetText(rb.PeerIP)
 		portEntry.SetText(strconv.Itoa(int(rb.RemotePort)))
 	})
+	resetBtn.Importance = widget.LowImportance
 
-	items := []*widget.FormItem{
-		widget.NewFormItem("Local Bind IP", ipEntry),
-		widget.NewFormItem("Local Port", portEntry),
-		widget.NewFormItem("", resetBtn),
-	}
-
-	dialog.ShowForm(
-		fmt.Sprintf("Override Local Mapping (%s %s:%d)", rb.PeerName, strings.ToUpper(rb.Protocol), rb.RemotePort),
-		"Apply",
-		"Cancel",
-		items,
+	d := dialog.NewForm(
+		fmt.Sprintf("Local address for %s", remoteTitle(rb)),
+		"Apply", "Cancel",
+		[]*widget.FormItem{
+			{Text: "IP address", Widget: ipEntry, HintText: "Usually the peer's own 127.0.0.x address"},
+			{Text: "Port", Widget: portEntry, HintText: "Change this if the port is already in use here"},
+			{Text: "", Widget: container.NewHBox(resetBtn)},
+		},
 		func(ok bool) {
 			if !ok {
 				return
 			}
 			pVal, err := strconv.ParseUint(strings.TrimSpace(portEntry.Text), 10, 16)
 			if err != nil || pVal == 0 {
-				dialog.ShowError(fmt.Errorf("invalid port number"), pp.ui.win)
+				dialog.ShowError(fmt.Errorf("invalid port number"), rp.ui.win)
 				return
 			}
-			if err := pp.ui.mgr.SetRemotePortOverride(rb.Key, strings.TrimSpace(ipEntry.Text), uint16(pVal)); err != nil {
-				dialog.ShowError(err, pp.ui.win)
-			}
+			bindIP := strings.TrimSpace(ipEntry.Text)
+			go func() {
+				if err := rp.ui.mgr.SetRemotePortOverride(rb.Key, bindIP, uint16(pVal)); err != nil {
+					fyne.Do(func() { dialog.ShowError(err, rp.ui.win) })
+				}
+			}()
 		},
-		pp.ui.win,
+		rp.ui.win,
 	)
+	d.Resize(fyne.NewSize(460, d.MinSize().Height))
+	d.Show()
 }
 
-func (pp *portsPanel) refresh(snap client.Snapshot) {
-	pp.mu.Lock()
-	pp.localShares = snap.LocalShares
-	pp.remoteBindings = snap.RemoteBindings
-	pp.mu.Unlock()
-
-	if len(snap.LocalShares) == 0 {
-		pp.localEmpty.Show()
-		pp.localList.Hide()
-	} else {
-		pp.localEmpty.Hide()
-		pp.localList.Show()
+// remoteTitle names a remote port for display, e.g. "Bob's Minecraft (TCP)".
+func remoteTitle(rb client.RemoteBindingStatus) string {
+	svc := rb.Name
+	if svc == "" {
+		svc = fmt.Sprintf("port %d", rb.RemotePort)
 	}
-	pp.localList.Refresh()
+	return fmt.Sprintf("%s's %s (%s)", rb.PeerName, svc, strings.ToUpper(rb.Protocol))
+}
 
-	if len(snap.RemoteBindings) == 0 {
-		pp.remoteEmpty.Show()
-		pp.remoteList.Hide()
-	} else {
-		pp.remoteEmpty.Hide()
-		pp.remoteList.Show()
+type remoteRow struct {
+	widget.BaseWidget
+
+	panel   *remotePortsPanel
+	title   *widget.Label
+	detail  *widget.RichText
+	chip    *copyChip
+	moreBtn *widget.Button
+
+	item client.RemoteBindingStatus
+}
+
+func newRemoteRow(rp *remotePortsPanel) *remoteRow {
+	r := &remoteRow{
+		panel:  rp,
+		title:  newTitle(),
+		detail: newMutedText(theme.SizeNameCaptionText),
+		chip: newCopyChip(theme.SizeNameText, theme.ColorNameForeground, func(v string) {
+			rp.ui.copyToClipboard(v, "address")
+		}),
 	}
-	pp.remoteList.Refresh()
+	r.moreBtn = newIconButton(theme.MoreVerticalIcon(), nil)
+	r.moreBtn.OnTapped = func() { r.panel.showMenu(r.item, r.moreBtn) }
+	r.ExtendBaseWidget(r)
+	return r
+}
+
+func (r *remoteRow) set(rb client.RemoteBindingStatus) {
+	r.item = rb
+	addr := rb.ActualBound
+	if addr == "" {
+		addr = fmt.Sprintf("%s:%d", rb.BindIP, rb.LocalPort)
+	}
+
+	title := rb.Name
+	if title == "" {
+		title = fmt.Sprintf("Port %d", rb.RemotePort)
+	}
+	if r.title.Text != title {
+		r.title.SetText(title)
+	}
+
+	from := fmt.Sprintf("%s · %s", rb.PeerName, strings.ToUpper(rb.Protocol))
+	switch {
+	case !rb.Enabled:
+		setMutedText(r.detail, from+" · Paused", "")
+		r.chip.SetValue(addr, true)
+	case rb.StatusErr != "":
+		setMutedText(r.detail, fmt.Sprintf("%s · Couldn't open %s: %s", from, addr, rb.StatusErr), theme.ColorNameError)
+		r.chip.SetValue(addr, true)
+	default:
+		setMutedText(r.detail, from+" · "+trafficSummary(rb.ActiveConns, rb.BytesTotal), "")
+		r.chip.SetValue(addr, false)
+	}
+}
+
+func (r *remoteRow) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(container.New(layout.NewCustomPaddedLayout(4, 4, 10, 2),
+		container.NewBorder(nil, nil, nil,
+			container.NewHBox(container.NewCenter(r.chip), container.NewCenter(r.moreBtn)),
+			twoLines(r.title, r.detail))))
+}
+
+// ---------------------------------------------------------------------------
+// Your shared ports: local services exposed to the room.
+// ---------------------------------------------------------------------------
+
+type sharePreset struct {
+	label string
+	proto string
+	port  string
+	name  string
+}
+
+var sharePresets = []sharePreset{
+	{"Minecraft (TCP + UDP 25565)", "TCP + UDP", "25565", "Minecraft"},
+	{"Web server (TCP 8080)", "TCP", "8080", "Web server"},
+	{"Vite dev server (TCP 5173)", "TCP", "5173", "Dev server"},
+}
+
+type localSharesPanel struct {
+	ui *UI
+
+	protoSelect *widget.Select
+	portEntry   *widget.Entry
+	nameEntry   *widget.Entry
+
+	items []client.LocalShareStatus
+	list  *widget.List
+	panel fyne.CanvasObject
+	empty fyne.CanvasObject
+	root  fyne.CanvasObject
+}
+
+func newLocalSharesPanel(u *UI) *localSharesPanel {
+	lp := &localSharesPanel{ui: u}
+
+	lp.protoSelect = widget.NewSelect([]string{"TCP", "UDP", "TCP + UDP"}, nil)
+	lp.protoSelect.SetSelected("TCP")
+
+	lp.portEntry = widget.NewEntry()
+	lp.portEntry.SetPlaceHolder("Port, e.g. 25565")
+	lp.portEntry.OnSubmitted = func(string) { lp.onShare() }
+
+	lp.nameEntry = widget.NewEntry()
+	lp.nameEntry.SetPlaceHolder("Name (optional)")
+	lp.nameEntry.OnSubmitted = func(string) { lp.onShare() }
+
+	shareBtn := widget.NewButtonWithIcon("Share", theme.ContentAddIcon(), lp.onShare)
+	shareBtn.Importance = widget.HighImportance
+
+	var presetsBtn *widget.Button
+	presetsBtn = widget.NewButtonWithIcon("Presets", theme.MenuDropDownIcon(), func() {
+		items := make([]*fyne.MenuItem, 0, len(sharePresets))
+		for _, p := range sharePresets {
+			items = append(items, fyne.NewMenuItem(p.label, func() {
+				lp.protoSelect.SetSelected(p.proto)
+				lp.portEntry.SetText(p.port)
+				lp.nameEntry.SetText(p.name)
+				lp.onShare()
+			}))
+		}
+		widget.ShowPopUpMenuAtRelativePosition(fyne.NewMenu("", items...), u.win.Canvas(),
+			fyne.NewPos(0, presetsBtn.Size().Height), presetsBtn)
+	})
+	presetsBtn.Importance = widget.LowImportance
+
+	form := container.NewBorder(nil, nil,
+		lp.protoSelect,
+		container.NewHBox(shareBtn, presetsBtn),
+		container.NewGridWithColumns(2, lp.portEntry, lp.nameEntry),
+	)
+	hint := newMutedText(theme.SizeNameCaptionText)
+	setMutedText(hint, "Only the ports listed here can be reached by people in the room.", "")
+
+	lp.empty = newEmptyState(theme.UploadIcon(), "You're not sharing anything",
+		"Add a port above to let people in the room reach a service running on this computer.")
+
+	lp.list = widget.NewList(
+		func() int { return len(lp.items) },
+		func() fyne.CanvasObject { return newLocalRow(lp) },
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			if id < 0 || id >= len(lp.items) {
+				return
+			}
+			obj.(*localRow).set(lp.items[id])
+		},
+	)
+	lp.list.OnSelected = func(widget.ListItemID) { lp.list.UnselectAll() }
+
+	lp.panel = newSurface(container.New(layout.NewCustomPaddedLayout(4, 4, 4, 4), lp.list), colorNameSurface)
+	lp.root = container.NewBorder(
+		container.New(layout.NewCustomPaddedVBoxLayout(-theme.InnerPadding()/2),
+			container.New(layout.NewCustomPaddedLayout(10, 0, 0, 0), form),
+			container.New(layout.NewCustomPaddedLayout(0, 4, 4, 0), hint)),
+		nil, nil, nil,
+		container.NewStack(lp.panel, lp.empty),
+	)
+	return lp
+}
+
+func (lp *localSharesPanel) onShare() {
+	portStr := strings.TrimSpace(lp.portEntry.Text)
+	val, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || val == 0 {
+		dialog.ShowError(fmt.Errorf("enter a port number between 1 and 65535"), lp.ui.win)
+		return
+	}
+
+	proto := "tcp"
+	switch lp.protoSelect.Selected {
+	case "UDP":
+		proto = "udp"
+	case "TCP + UDP":
+		proto = "both"
+	}
+
+	name := strings.TrimSpace(lp.nameEntry.Text)
+	if err := lp.ui.mgr.AddSharedPort(proto, uint16(val), name); err != nil {
+		dialog.ShowError(err, lp.ui.win)
+		return
+	}
+	lp.portEntry.SetText("")
+	lp.nameEntry.SetText("")
+}
+
+func (lp *localSharesPanel) refresh(snap client.Snapshot) {
+	lp.items = snap.LocalShares
+	if len(lp.items) == 0 {
+		lp.panel.Hide()
+		lp.empty.Show()
+	} else {
+		lp.empty.Hide()
+		lp.panel.Show()
+	}
+	lp.list.Refresh()
+}
+
+type localRow struct {
+	widget.BaseWidget
+
+	panel   *localSharesPanel
+	title   *widget.Label
+	detail  *widget.RichText
+	stopBtn *widget.Button
+
+	proto string
+	port  uint16
+}
+
+func newLocalRow(lp *localSharesPanel) *localRow {
+	r := &localRow{
+		panel:  lp,
+		title:  newTitle(),
+		detail: newMutedText(theme.SizeNameCaptionText),
+	}
+	r.stopBtn = widget.NewButtonWithIcon("Stop sharing", theme.CancelIcon(), func() {
+		go r.panel.ui.mgr.RemoveSharedPort(r.proto, r.port)
+	})
+	r.stopBtn.Importance = widget.LowImportance
+	r.ExtendBaseWidget(r)
+	return r
+}
+
+func (r *localRow) set(sh client.LocalShareStatus) {
+	r.proto = sh.Protocol
+	r.port = sh.Port
+
+	title := sh.Name
+	if title == "" {
+		title = fmt.Sprintf("Port %d", sh.Port)
+	}
+	if r.title.Text != title {
+		r.title.SetText(title)
+	}
+	setMutedText(r.detail, fmt.Sprintf("%s %d · %s",
+		strings.ToUpper(sh.Protocol), sh.Port, trafficSummary(sh.ActiveConns, sh.BytesTotal)), "")
+}
+
+func (r *localRow) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(container.New(layout.NewCustomPaddedLayout(4, 4, 10, 2),
+		container.NewBorder(nil, nil, nil, container.NewCenter(r.stopBtn),
+			twoLines(r.title, r.detail))))
+}
+
+// trafficSummary renders live connection stats, e.g. "2 connections · 1.2 MB".
+func trafficSummary(active int32, total uint64) string {
+	if active == 0 && total == 0 {
+		return "Idle"
+	}
+	return fmt.Sprintf("%s · %s", plural(int(active), "connection", "connections"), formatBytes(total))
+}
+
+func validatePort(s string) error {
+	if v, err := strconv.ParseUint(strings.TrimSpace(s), 10, 16); err != nil || v == 0 {
+		return fmt.Errorf("must be 1–65535")
+	}
+	return nil
 }

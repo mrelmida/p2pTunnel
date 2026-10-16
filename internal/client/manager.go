@@ -76,6 +76,9 @@ type Snapshot struct {
 	LocalShares    []LocalShareStatus
 	RemoteBindings []RemoteBindingStatus
 	Logs           []string
+	// LogSeq counts every log line ever written. Logs is capped, so consumers
+	// must use LogSeq (not len(Logs)) to detect and count new lines.
+	LogSeq uint64
 }
 
 type localSharedPort struct {
@@ -108,8 +111,9 @@ type Manager struct {
 	localShares    map[string]*localSharedPort
 	remoteBindings map[string]*remotePortBinding
 
-	logMu sync.Mutex
-	logs  []string
+	logMu  sync.Mutex
+	logs   []string
+	logSeq uint64
 
 	wg sync.WaitGroup
 }
@@ -232,8 +236,11 @@ func (m *Manager) connectRoom(
 	}
 
 	// 2. Dial EU Signaling Server over TLS 1.3.
-	dialer := &net.Dialer{Timeout: 8 * time.Second}
-	sigConn, err := tls.DialWithDialer(dialer, "tcp", serverAddr, m.identity.SignalingClientTLSConfig())
+	tlsDialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 8 * time.Second},
+		Config:    m.identity.SignalingClientTLSConfig(),
+	}
+	sigConn, err := tlsDialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
 		_ = quicLn.Close()
 		_ = quicTr.Close()
@@ -251,23 +258,35 @@ func (m *Manager) connectRoom(
 		return err
 	}
 
+	// Bound the handshake by both a fixed timeout and ctx: cancelling ctx
+	// expires the deadline so a blocked read/write returns immediately.
 	_ = sigConn.SetDeadline(time.Now().Add(10 * time.Second))
-	if err := protocol.WriteSignalingMsg(sigConn, handshakeEnv); err != nil {
+	stopCancelWatch := context.AfterFunc(ctx, func() { _ = sigConn.SetDeadline(time.Now()) })
+	handshakeErr := func(what string, err error) error {
 		_ = sigConn.Close()
 		_ = quicLn.Close()
 		_ = quicTr.Close()
 		_ = rawUDP.Close()
-		return fmt.Errorf("send room handshake: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("%s: %w", what, err)
+	}
+
+	if err := protocol.WriteSignalingMsg(sigConn, handshakeEnv); err != nil {
+		stopCancelWatch()
+		return handshakeErr("send room handshake", err)
 	}
 
 	respEnv, err := protocol.ReadSignalingMsg(sigConn)
+	if !stopCancelWatch() {
+		// ctx fired while we were finishing; honour it rather than racing
+		// its deadline reset against the one below.
+		return handshakeErr("read room handshake response", ctx.Err())
+	}
 	_ = sigConn.SetDeadline(time.Time{})
 	if err != nil {
-		_ = sigConn.Close()
-		_ = quicLn.Close()
-		_ = quicTr.Close()
-		_ = rawUDP.Close()
-		return fmt.Errorf("read room handshake response: %w", err)
+		return handshakeErr("read room handshake response", err)
 	}
 
 	if respEnv.Type == protocol.MsgError {
@@ -340,7 +359,7 @@ func (m *Manager) connectRoom(
 		joined.RoomCode, joined.Self.VirtualIP, joined.Self.Slot)
 
 	m.wg.Add(3)
-	go m.acceptQUICLoop(roomCtx)
+	go m.acceptQUICLoop(roomCtx, quicLn)
 	go m.signalingReadLoop(roomCtx, sigConn)
 	go m.udpProbeKeepaliveLoop(roomCtx, serverUDPAddr, joined.RoomToken, joined.Self.Slot)
 
@@ -351,6 +370,10 @@ func (m *Manager) connectRoom(
 
 // LeaveRoom disconnects from the current room and stops all active peer tunnels and port listeners.
 func (m *Manager) LeaveRoom() {
+	// Detach the room's resources under the lock, but close them only after
+	// releasing it: closing the QUIC transport waits for its read loop, and
+	// that loop's callbacks (onProbeAck, onPunchReceived, fingerprint checks)
+	// take m.mu themselves.
 	m.mu.Lock()
 	if !m.connected && m.roomCancel == nil {
 		m.mu.Unlock()
@@ -362,20 +385,29 @@ func (m *Manager) LeaveRoom() {
 	m.roomToken = 0
 	m.selfInfo = protocol.PeerInfo{}
 
-	if m.roomCancel != nil {
-		m.roomCancel()
-		m.roomCancel = nil
+	roomCancel := m.roomCancel
+	sigConn := m.sigConn
+	bindings := m.remoteBindings
+	peers := m.peers
+	quicLn, quicTr, rawUDP := m.quicLn, m.quicTr, m.rawUDP
+
+	m.roomCancel = nil
+	m.sigConn = nil
+	m.remoteBindings = make(map[string]*remotePortBinding)
+	m.peers = make(map[string]*peerTunnel)
+	m.quicLn, m.quicTr, m.rawUDP = nil, nil, nil
+	m.mu.Unlock()
+
+	if roomCancel != nil {
+		roomCancel()
 	}
-	if m.sigConn != nil {
-		_ = m.sigConn.Close()
-		m.sigConn = nil
+	if sigConn != nil {
+		_ = sigConn.Close()
 	}
-	for _, rb := range m.remoteBindings {
+	for _, rb := range bindings {
 		rb.stop()
 	}
-	m.remoteBindings = make(map[string]*remotePortBinding)
-
-	for _, pt := range m.peers {
+	for _, pt := range peers {
 		pt.mu.Lock()
 		if pt.cancelDial != nil {
 			pt.cancelDial()
@@ -385,21 +417,15 @@ func (m *Manager) LeaveRoom() {
 		}
 		pt.mu.Unlock()
 	}
-	m.peers = make(map[string]*peerTunnel)
-
-	if m.quicLn != nil {
-		_ = m.quicLn.Close()
-		m.quicLn = nil
+	if quicLn != nil {
+		_ = quicLn.Close()
 	}
-	if m.quicTr != nil {
-		_ = m.quicTr.Close()
-		m.quicTr = nil
+	if quicTr != nil {
+		_ = quicTr.Close()
 	}
-	if m.rawUDP != nil {
-		_ = m.rawUDP.Close()
-		m.rawUDP = nil
+	if rawUDP != nil {
+		_ = rawUDP.Close()
 	}
-	m.mu.Unlock()
 
 	m.wg.Wait()
 	if roomCode != "" {
@@ -892,6 +918,7 @@ func (m *Manager) Snapshot() Snapshot {
 
 	m.logMu.Lock()
 	snap.Logs = append([]string(nil), m.logs...)
+	snap.LogSeq = m.logSeq
 	m.logMu.Unlock()
 
 	return snap
@@ -901,6 +928,7 @@ func (m *Manager) logf(format string, args ...any) {
 	line := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 	m.logMu.Lock()
 	m.logs = append(m.logs, line)
+	m.logSeq++
 	if len(m.logs) > 200 {
 		m.logs = m.logs[len(m.logs)-200:]
 	}

@@ -2,11 +2,11 @@ package ui
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -14,26 +14,39 @@ import (
 	"p2pTunnel/internal/client"
 )
 
-// UI holds the Fyne desktop application state and panels.
+// UI holds the Fyne desktop application state and views.
+//
+// The window shows one of two screens: the connect screen (pick a name and
+// room) or the room screen (people, ports). Relay settings live in a dialog
+// and the activity log in its own window, so neither crowds the main view.
 type UI struct {
 	app fyne.App
 	win fyne.Window
 	mgr *client.Manager
 
-	connBar    *connectionBar
-	peersPanel *peersPanel
-	portsPanel *portsPanel
+	connectView *connectView
+	roomView    *roomView
+	logWindow   *logWindow
 
-	logEntry   *widget.Entry
-	footerText *widget.Label
-	lastLogLen int
+	statusText *widget.RichText
+	flashSeq   int
+	flashing   bool
+	idleStatus string
+
+	viewInit     bool
+	connected    bool
+	lastRoomCode string
+	userLeft     bool // set by "Leave room" so a deliberate exit isn't reported as a drop
 }
 
 // Run launches the Fyne desktop GUI application.
 func Run(defaultIP, defaultPort, defaultSecret, defaultName string, forceRelay bool) error {
 	fyneApp := app.NewWithID("io.p2ptunnel.desktop")
-	win := fyneApp.NewWindow("p2pTunnel — P2P Port & IP Sharing")
-	win.Resize(fyne.NewSize(1040, 740))
+	fyneApp.Settings().SetTheme(&tunnelTheme{})
+	fyneApp.SetIcon(logoResource)
+	win := fyneApp.NewWindow("p2pTunnel")
+	win.SetMaster()
+	win.Resize(fyne.NewSize(960, 640))
 
 	u := &UI{
 		app: fyneApp,
@@ -63,45 +76,24 @@ func Run(defaultIP, defaultPort, defaultSecret, defaultName string, forceRelay b
 	}
 	u.mgr = mgr
 
-	u.connBar = newConnectionBar(u, defaultIP, defaultPort, defaultSecret, defaultName)
-	u.peersPanel = newPeersPanel(u)
-	u.portsPanel = newPortsPanel(u)
+	u.connectView = newConnectView(u, defaultIP, defaultPort, defaultSecret, defaultName)
+	u.roomView = newRoomView(u)
+	u.logWindow = newLogWindow(u)
 
-	u.logEntry = widget.NewMultiLineEntry()
-	u.logEntry.Wrapping = fyne.TextWrapWord
-	u.logEntry.TextStyle = fyne.TextStyle{Monospace: true}
-
-	u.footerText = widget.NewLabel("Ready — Zero-admin loopback IP mode (127.0.0.x)")
-
-	copyLogBtn := widget.NewButtonWithIcon("Copy Log", theme.ContentCopyIcon(), func() {
-		win.Clipboard().SetContent(u.logEntry.Text)
-		u.setFooterStatus("Copied activity log to clipboard")
-	})
-
-	logAccordion := widget.NewAccordion(
-		widget.NewAccordionItem("Activity & Connection Log", container.NewBorder(
-			nil,
-			container.NewBorder(nil, nil, nil, copyLogBtn, u.footerText),
-			nil, nil,
-			container.NewGridWrap(fyne.NewSize(980, 115), u.logEntry),
-		)),
-	)
-	logAccordion.Open(0)
-
-	mainSplit := container.NewHSplit(u.peersPanel.root, u.portsPanel.root)
-	mainSplit.Offset = 0.34
-
-	content := container.NewBorder(
-		u.connBar.root,
-		logAccordion,
-		nil, nil,
-		mainSplit,
+	u.statusText = newMutedText(theme.SizeNameCaptionText)
+	logBtn := widget.NewButtonWithIcon("Activity log", theme.ListIcon(), u.logWindow.show)
+	logBtn.Importance = widget.LowImportance
+	statusBar := container.NewStack(
+		canvas.NewRectangle(theme.Color(colorNameShaft)),
+		container.NewBorder(widget.NewSeparator(), nil, nil, logBtn,
+			container.NewPadded(u.statusText)),
 	)
 
-	win.SetContent(content)
+	win.SetContent(container.NewBorder(nil, statusBar, nil, nil,
+		container.NewStack(u.connectView.root, u.roomView.root)))
 	u.refreshAll(mgr.Snapshot())
 
-	// Periodic 1.5s refresh for live traffic counters and ping updates.
+	// Periodic refresh for live traffic counters and ping updates.
 	stopTicker := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(1500 * time.Millisecond)
@@ -128,36 +120,70 @@ func Run(defaultIP, defaultPort, defaultSecret, defaultName string, forceRelay b
 	return nil
 }
 
-func (u *UI) setFooterStatus(msg string) {
-	if u.footerText != nil {
-		u.footerText.SetText(msg)
-	}
-}
-
 func (u *UI) refreshAll(snap client.Snapshot) {
-	if u.connBar == nil || u.peersPanel == nil || u.portsPanel == nil {
+	if u.connectView == nil || u.roomView == nil || u.logWindow == nil {
 		return
 	}
-	u.connBar.refresh(snap)
-	u.peersPanel.refresh(snap)
-	u.portsPanel.refresh(snap)
 
-	if len(snap.Logs) != u.lastLogLen {
-		u.lastLogLen = len(snap.Logs)
-		u.logEntry.SetText(strings.Join(snap.Logs, "\n"))
-		u.logEntry.CursorRow = len(snap.Logs)
+	if !u.viewInit || snap.Connected != u.connected {
+		wasConnected := u.viewInit && u.connected
+		u.viewInit = true
+		u.connected = snap.Connected
+		if snap.Connected {
+			u.lastRoomCode = snap.RoomCode
+			u.userLeft = false
+			u.connectView.root.Hide()
+			u.roomView.root.Show()
+		} else {
+			u.roomView.root.Hide()
+			u.connectView.root.Show()
+			if wasConnected {
+				// Prefill the code so rejoining is one click, and explain
+				// an exit the user didn't ask for.
+				u.connectView.codeEntry.SetText(u.lastRoomCode)
+				if !u.userLeft {
+					u.connectView.setStatus(fmt.Sprintf(
+						"Lost connection to room %s. Join again to reconnect.", u.lastRoomCode),
+						widget.DangerImportance)
+				}
+			}
+		}
+	}
+
+	if snap.Connected {
+		u.roomView.refresh(snap)
+		u.idleStatus = fmt.Sprintf("Connected · relay server %s", snap.ServerAddr)
+	} else {
+		u.idleStatus = "Not connected"
+	}
+	u.logWindow.refresh(snap)
+
+	if !u.flashing {
+		setMutedText(u.statusText, u.idleStatus, "")
 	}
 }
 
-func formatBytes(b uint64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
+// flash shows a short-lived message in the status bar, e.g. after copying.
+func (u *UI) flash(msg string) {
+	u.flashSeq++
+	seq := u.flashSeq
+	u.flashing = true
+	setMutedText(u.statusText, msg, theme.ColorNameForeground)
+	time.AfterFunc(4*time.Second, func() {
+		fyne.Do(func() {
+			if u.flashSeq == seq {
+				u.flashing = false
+				setMutedText(u.statusText, u.idleStatus, "")
+			}
+		})
+	})
+}
+
+// copyToClipboard copies value and confirms it in the status bar.
+func (u *UI) copyToClipboard(value, what string) {
+	if value == "" {
+		return
 	}
-	div, exp := uint64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+	u.app.Clipboard().SetContent(value)
+	u.flash(fmt.Sprintf("Copied %s %s to the clipboard", what, value))
 }

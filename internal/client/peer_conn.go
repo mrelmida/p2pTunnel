@@ -69,10 +69,10 @@ func defaultQUICConfig() *quic.Config {
 	}
 }
 
-func (m *Manager) acceptQUICLoop(ctx context.Context) {
+func (m *Manager) acceptQUICLoop(ctx context.Context, ln *quic.Listener) {
 	defer m.wg.Done()
 	for {
-		conn, err := m.quicLn.Accept(ctx)
+		conn, err := ln.Accept(ctx)
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, quic.ErrServerClosed) {
 				return
@@ -339,7 +339,12 @@ func (m *Manager) tryDialDirect(ctx context.Context, pt *peerTunnel) *quic.Conn 
 		attemptCtx, cancel := context.WithTimeout(ctx, 600*time.Millisecond)
 		quicCfg := defaultQUICConfig()
 		quicCfg.HandshakeIdleTimeout = 550 * time.Millisecond
-		c, err := m.quicTr.Dial(attemptCtx, addr, tlsCfg, quicCfg)
+		tr := m.transport()
+		if tr == nil {
+			cancel()
+			return nil // left the room mid-dial
+		}
+		c, err := tr.Dial(attemptCtx, addr, tlsCfg, quicCfg)
 		cancel()
 		if err == nil && c != nil {
 			return c
@@ -360,7 +365,24 @@ func (m *Manager) tryDialRelay(ctx context.Context, peer protocol.PeerInfo) (*qu
 	quicCfg := defaultQUICConfig()
 	quicCfg.HandshakeIdleTimeout = 3500 * time.Millisecond
 
-	return m.quicTr.Dial(relayCtx, relayAddr, tlsCfg, quicCfg)
+	// A cancelled direct dial falls through to here; don't start a relay
+	// dial for a room we've already left.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	tr := m.transport()
+	if tr == nil {
+		return nil, errors.New("left the room")
+	}
+	return tr.Dial(relayCtx, relayAddr, tlsCfg, quicCfg)
+}
+
+// transport returns the room's QUIC transport, or nil once LeaveRoom has
+// detached it. Dial goroutines must use this rather than reading m.quicTr.
+func (m *Manager) transport() *quic.Transport {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.quicTr
 }
 
 func (m *Manager) pingPeerLoop(ctx context.Context, peerID string, conn *quic.Conn) {

@@ -1,0 +1,21 @@
+# Build stage
+FROM golang:alpine AS builder
+ENV GOTOOLCHAIN=auto
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/server ./cmd/server
+COPY internal/crypto ./internal/crypto
+COPY internal/protocol ./internal/protocol
+COPY internal/server ./internal/server
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/p2ptunnel-server ./cmd/server
+
+# Runtime stage
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /out/p2ptunnel-server /usr/local/bin/p2ptunnel-server
+ENV RELAY_IP=0.0.0.0
+ENV RELAY_PORT=4433
+ENV RELAY_SECRET=
+EXPOSE 4433/tcp 4433/udp
+ENTRYPOINT ["/usr/local/bin/p2ptunnel-server"]

@@ -1,0 +1,15 @@
+services:
+  p2ptunnel-relay:
+    image: ${RELAY_IMAGE:-ghcr.io/mrelmida/p2ptunnel-relay:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: p2ptunnel-relay
+    restart: unless-stopped
+    environment:
+      RELAY_IP: "${RELAY_IP:-0.0.0.0}"
+      RELAY_PORT: "${RELAY_PORT:-4433}"
+      RELAY_SECRET: "${RELAY_SECRET:-change-this-relay-secret}"
+    ports:
+      - "${RELAY_BIND_IP:-0.0.0.0}:${RELAY_PORT:-4433}:${RELAY_PORT:-4433}/tcp"
+      - "${RELAY_BIND_IP:-0.0.0.0}:${RELAY_PORT:-4433}:${RELAY_PORT:-4433}/udp"

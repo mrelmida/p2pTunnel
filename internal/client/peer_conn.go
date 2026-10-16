@@ -122,10 +122,12 @@ func (m *Manager) installPeerConn(ctx context.Context, peerID string, conn *quic
 	oldConn := pt.activeConn
 	oldMode := pt.mode
 
-	// Always prefer Direct P2P over EU Relay if the existing Direct connection is still alive.
+	// Keep an existing alive Direct P2P connection, and never replace an alive connection of the same or better tier.
 	shouldReplace := true
 	if oldConn != nil && oldConn.Context().Err() == nil {
-		if oldMode == TransportDirect && mode == TransportRelay {
+		if oldMode == TransportDirect {
+			shouldReplace = false
+		} else if oldMode == TransportRelay && mode == TransportRelay {
 			shouldReplace = false
 		}
 	}
@@ -317,50 +319,33 @@ func (m *Manager) tryDialDirect(ctx context.Context, pt *peerTunnel) *quic.Conn 
 		return nil
 	}
 
-	directCtx, cancel := context.WithTimeout(ctx, 2200*time.Millisecond)
-	defer cancel()
-
 	tlsCfg := m.identity.PeerClientTLSConfig(peer.CertFingerprint)
-	quicCfg := defaultQUICConfig()
-	quicCfg.HandshakeIdleTimeout = 2 * time.Second
-
-	resCh := make(chan *quic.Conn, len(candidates))
-	var wg sync.WaitGroup
 	seen := make(map[string]bool)
 
 	for _, addr := range candidates {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if addr == nil || seen[addr.String()] {
 			continue
 		}
 		seen[addr.String()] = true
-		wg.Add(1)
-		go func(target *net.UDPAddr) {
-			defer wg.Done()
-			c, err := m.quicTr.Dial(directCtx, target, tlsCfg, quicCfg)
-			if err == nil {
-				select {
-				case resCh <- c:
-				default:
-					_ = c.CloseWithError(0, "duplicate direct dial")
-				}
-			}
-		}(addr)
-	}
 
-	doneCh := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(doneCh)
-	}()
+		// Stop dialing if an incoming Direct P2P connection was already accepted.
+		if conn, mode := pt.getConn(); conn != nil && conn.Context().Err() == nil && mode == TransportDirect {
+			return nil
+		}
 
-	select {
-	case win := <-resCh:
-		return win
-	case <-doneCh:
-		return nil
-	case <-directCtx.Done():
-		return nil
+		attemptCtx, cancel := context.WithTimeout(ctx, 600*time.Millisecond)
+		quicCfg := defaultQUICConfig()
+		quicCfg.HandshakeIdleTimeout = 550 * time.Millisecond
+		c, err := m.quicTr.Dial(attemptCtx, addr, tlsCfg, quicCfg)
+		cancel()
+		if err == nil && c != nil {
+			return c
+		}
 	}
+	return nil
 }
 
 func (m *Manager) tryDialRelay(ctx context.Context, peer protocol.PeerInfo) (*quic.Conn, error) {
